@@ -69,6 +69,7 @@ The platform credential is currently stored in three places, and the leak vector
 | Customer use of the platform credential is forbidden | Customers using it can be cut off without a migration period |
 | Clusters run both Kafka 2.7 (ZooKeeper) and 3.x (KRaft) | Two execution paths for the internal links |
 | 61 clusters share the platform credential | Rollout needs per-cluster automation |
+| Ansible pipelines already reach all 61 clusters | Rotation steps become Ansible playbooks, run per cluster or in batches |
 
 ## Target identity model (proposed)
 
@@ -83,7 +84,39 @@ One identity per component, each with only the permissions it needs.
 | `america-box` | America box | Admin (Create, Alter, Delete) |
 | `franz` | Franz | Read-only (Describe) |
 
-Open design choices: one password per cluster or one for all 61, and where secrets are stored.
+### Open design choices
+
+Two decisions are still open for the new identities.
+
+#### 1. One password per cluster, or one for all 61?
+
+The usernames above stay the same on every cluster. The question is whether each user gets the same password everywhere or a different password on each cluster.
+
+**Option A: One password for all 61 clusters**
+
+Each identity, for example `monitoring`, has one password that works on every cluster.
+
+- Good: few secrets to manage, 6 in total. Simple for America box, Franz and monitoring, which each hold one password.
+- Bad: one leak exposes all 61 clusters again. This is the same failure as today, only per identity instead of for everything.
+- Bad: changing a password means changing it on all 61 clusters at once.
+
+**Option B: Mixed**
+
+Per-cluster passwords for the identities that only live inside a cluster: `kafka-broker`, plus `zk-client` on ZooKeeper clusters or `kafka-controller` on KRaft clusters. One shared password for the central services: `monitoring`, `america-box` and `franz`.
+
+- Good: the powerful internal identities, which are super users, are limited to one cluster each. Central services stay simple.
+- Bad: the central services still share one password across 61 clusters. `america-box` has admin rights, so a leak of its password is serious.
+
+| Option | Secrets to manage | Impact of one leak | Effort |
+| --- | --- | --- | --- |
+| A. One for all | 6 | All 61 clusters | Low |
+| B. Mixed | 2 × 61 + 3 = 125 | One cluster for internal identities, all clusters for central services | Medium |
+
+Ruled out: a different password for every identity on every cluster (5 × 61 = 305 secrets). America box, Franz and monitoring would each have to hold 61 passwords and pick the right one per cluster, which is not practical.
+
+#### 2. Where are the secrets stored?
+
+See [Secret storage options](#secret-storage-options) under Open questions.
 
 ## Approach
 
@@ -131,28 +164,62 @@ flowchart LR
 - [ ] Is `User:Kafka` in `super.users`?
 - [ ] Do America box and Franz hold one credential for all clusters, or one per cluster?
 - [ ] One password per cluster, or one for all 61?
-- [ ] Where will secrets be stored?
-- [ ] Which automation tool reaches all 61 clusters?
+- [ ] Are the current credential managers (GitLab CI secrets, OpenShift Secrets) enough, or should we adopt another option? See [Secret storage options](#secret-storage-options).
 
-## Reference commands
+### Secret storage options
 
-These work on Kafka 2.7 and 3.x via `--bootstrap-server`.
+**The question:** after we create the new passwords, where do we keep them? Today the platform password sits in three places: in code, in GitLab CI secrets, and in OpenShift Secrets. We don't know which one leaked. If we put the new passwords in the same places, they may leak the same way.
 
-```bash
-# create a user
-kafka-configs.sh --bootstrap-server <broker>:<port> --command-config admin.properties \
-  --alter --entity-type users --entity-name monitoring \
-  --add-config 'SCRAM-SHA-256=[iterations=8192,password=<new-password>]'
+**The constraint:** we are air-gapped. Every option must run inside our network, with no internet access. Cloud services like AWS Secrets Manager are out.
 
-# list users that have SCRAM credentials
-kafka-configs.sh --bootstrap-server <broker>:<port> --command-config admin.properties \
-  --describe --entity-type users
+#### Option 1: Keep what we have, but lock it down
 
-# cut off the old user (re-run the create command to roll back)
-kafka-configs.sh --bootstrap-server <broker>:<port> --command-config admin.properties \
-  --alter --entity-type users --entity-name Kafka \
-  --delete-config 'SCRAM-SHA-256'
+Keep using GitLab CI secrets and OpenShift Secrets. Remove the passwords from code, and tighten who can read them.
 
-# inspect a broker's auth config
-grep -E "sasl|super.users|set.acl|jaas|authorizer" /path/to/server.properties
-```
+- Good: nothing new to install. Fastest option.
+- Bad: passwords still live in two places. Hard to see who read a password. Changing passwords stays a manual job.
+- Note: OpenShift Secrets are not encrypted by default, only encoded. Encryption must be turned on in the cluster.
+
+#### Option 2: One central password vault (HashiCorp Vault or OpenBao)
+
+Install a dedicated secrets server inside our network. All passwords live there. Services and pipelines ask it for passwords when they need them.
+
+- Good: one place for all passwords. Logs every read, so we can see who accessed what. Fine-grained permissions per service.
+- Bad: a new system to install, operate and back up.
+- Air gap: works offline. OpenBao is the free, open-source version of Vault, so it needs no license.
+
+#### Option 3: Central vault + automatic sync to OpenShift (External Secrets Operator)
+
+An add-on to option 2. A small OpenShift component copies passwords from the vault into OpenShift Secrets automatically. Our apps don't need to change: they keep reading OpenShift Secrets as they do today.
+
+- Good: apps stay the same. When a password changes in the vault, OpenShift gets the new one automatically.
+- Bad: requires option 2 first.
+- Air gap: works offline once its image is copied to our internal registry.
+
+#### Option 4: Encrypted passwords in Git (Sealed Secrets)
+
+Store passwords in Git, encrypted. Only the OpenShift cluster can decrypt them.
+
+- Good: simple. Nothing readable in the repo.
+- Bad: no logs of who read what, and no help with changing passwords. Protects Git only.
+- Air gap: works offline.
+
+#### Option 5: Certificates instead of passwords (mTLS)
+
+Stop using passwords altogether. Each service proves its identity with a certificate that expires and renews automatically.
+
+- Good: no password to leak.
+- Bad: the biggest change. Every cluster and every service must be reconfigured. Better suited to a later project.
+- Air gap: works offline with our own internal certificate authority.
+
+#### Summary
+
+| Option | Effort | Protects against another leak | Logs who read a password |
+| --- | --- | --- | --- |
+| 1. Lock down current stores | Low | Partly | No |
+| 2. Central vault | Medium | Yes | Yes |
+| 3. Vault + OpenShift sync | Medium | Yes | Yes |
+| 4. Encrypted in Git | Low | Partly | No |
+| 5. Certificates | High | Yes, best | Depends on setup |
+
+
