@@ -60,6 +60,42 @@ The platform credential is currently stored in three places, and the leak vector
 - GitLab CI secrets
 - OpenShift Secrets
 
+### Finding hardcoded uses with Gitleaks
+
+[Gitleaks](https://github.com/gitleaks/gitleaks) is a free, open-source tool that scans Git repositories for secrets, including the full commit history. It is a single binary with no network calls, so it runs in the air gap.
+
+We use it twice:
+
+1. **Before the rotation:** find every repo and config file that contains the platform credential. Each hit is a consumer that must move to a new identity before the old credential is deleted.
+2. **After the rotation:** run it as a GitLab CI job and a pre-commit hook, so no new password is ever committed.
+
+A custom rule catches the leaked password on top of the built-in rules:
+
+```toml
+# gitleaks.toml
+[extend]
+useDefault = true
+
+[[rules]]
+id = "kafka-platform-password"
+description = "Leaked Kafka platform password"
+regex = '''Kafkapass'''
+```
+
+Scan a repo, including its history, or a plain folder of config files:
+
+```bash
+gitleaks git --config gitleaks.toml --report-path kafka-leaks.json /path/to/repo
+gitleaks dir --config gitleaks.toml /path/to/configs
+```
+
+The JSON report lists file, line, commit and author for each hit, which gives an owner per consumer.
+
+Limits:
+
+- Gitleaks only sees Git and files on disk. GitLab CI variables and OpenShift Secrets must be checked separately, through the GitLab API and `oc get secrets`.
+- The old password stays in Git history. We don't need to rewrite history, because the password is deleted from Kafka at the end of the rotation.
+
 ## Known facts
 
 | Fact | Implication |
@@ -122,6 +158,8 @@ See [Secret storage options](#secret-storage-options) under Open questions.
 
 New identities are added alongside the old one, and the old credential is deleted only after every internal consumer has moved. Pilot on one test cluster of each type (2.7 and 3.x) first.
 
+Before any cluster work: run the Gitleaks scan across all repos and config folders, and check GitLab CI variables and OpenShift Secrets. This gives the list of internal consumers to move.
+
 Per-cluster sequence:
 
 1. Create the new SCRAM users (live, no restart).
@@ -146,14 +184,14 @@ flowchart LR
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Forgotten internal consumer still on `Kafka` | Outage at cutoff | Verify principals and source IPs in logs before step 6 |
+| Forgotten internal consumer still on `Kafka` | Outage at cutoff | Gitleaks scan up front to list consumers; verify principals and source IPs in logs before step 6 |
 | Deleting `Kafka` before brokers move | Whole cluster down | Enforce step order; brokers first |
 | Changing the `Kafka` password in place | All consumers break at once | Never change it; create new users instead |
 | `zookeeper.set.acl=true` with a renamed ZK user | Brokers locked out of metadata | Keep the ZK username, rotate the password only |
 | SCRAM likely unsupported on the KRaft controller listener | Controller link needs a static mechanism | Verify `sasl.mechanism.controller.protocol` |
 | New users not scoped by ACLs | New users also get full access | Verify `authorizer.class.name` and define ACLs per identity |
 | Customer code produces or consumes with `Kafka` | Customer apps break at cutoff | Accepted: customer use is forbidden |
-| Leak vector unknown | New credentials leak the same way | No hardcoded credentials; review read access to OpenShift namespaces and GitLab CI variables before issuing new ones |
+| Leak vector unknown | New credentials leak the same way | No hardcoded credentials, enforced by Gitleaks in GitLab CI and pre-commit; review read access to OpenShift namespaces and GitLab CI variables before issuing new ones |
 
 ## Open questions
 
